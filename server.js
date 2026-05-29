@@ -37,6 +37,7 @@ app.get('/invite', (req, res) => {
         response_type: 'code',
         redirect_uri:  REDIRECT_URI,
         state:         token,
+        prompt:        'none',
     });
 
     res.redirect(`https://discord.com/oauth2/authorize?${params}`);

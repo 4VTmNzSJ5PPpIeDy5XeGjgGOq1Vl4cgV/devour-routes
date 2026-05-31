@@ -5,11 +5,14 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-const BOT_URL        = process.env.BOT_URL || 'https://cufflink-fall-outbid.ngrok-free.dev';
-const SHARED_SECRET  = process.env.SHARED_SECRET;
-const CLIENT_ID      = process.env.DISCORD_CLIENT_ID;
-const CLIENT_SECRET  = process.env.DISCORD_CLIENT_SECRET;
-const REDIRECT_URI   = process.env.OAUTH_REDIRECT_URI || 'https://devour-routing.onrender.com/callback';
+const BOT_URL       = process.env.BOT_URL || 'https://cufflink-fall-outbid.ngrok-free.dev';
+const SHARED_SECRET = process.env.SHARED_SECRET;
+const CLIENT_ID     = process.env.DISCORD_CLIENT_ID;
+const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const REDIRECT_URI  = process.env.OAUTH_REDIRECT_URI || 'https://devour-routing.onrender.com/callback';
+
+// In-memory IP store — token → ip, auto-cleared after 10 minutes
+const pendingIps = new Map();
 
 // ─── Step 1: Visitor clicks invite link ──────────────────────────────────────
 // Capture IP, generate token, redirect to Discord OAuth
@@ -19,15 +22,8 @@ app.get('/invite', (req, res) => {
                   || req.socket.remoteAddress;
     const token = uuidv4();
 
-    // Fire and forget — send IP + token to bot for storage
-    fetch(`${BOT_URL}/internal/correlation/init`, {
-        method:  'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-internal-secret': SHARED_SECRET,
-        },
-        body: JSON.stringify({ token, ip }),
-    }).catch(err => console.error('[invite] Failed to notify bot:', err.message));
+    pendingIps.set(token, ip);
+    setTimeout(() => pendingIps.delete(token), 10 * 60 * 1000);
 
     console.log(`[invite] Token ${token} → IP ${ip}`);
 
@@ -44,11 +40,14 @@ app.get('/invite', (req, res) => {
 });
 
 // ─── Step 2: Discord sends user back here ────────────────────────────────────
-// Exchange code → get Discord ID → send to bot → redirect to bot invite
+// Exchange code → get Discord ID → save correlation → redirect to bot invite
 
 app.get('/callback', async (req, res) => {
     const { code, state: token } = req.query;
     if (!code || !token) return res.status(400).send('Missing code or state');
+
+    const ip = pendingIps.get(token) ?? 'unknown';
+    pendingIps.delete(token);
 
     try {
         // Exchange code for access token
@@ -76,17 +75,17 @@ app.get('/callback', async (req, res) => {
         });
         const { id: discordId } = await userRes.json();
 
-        // Send Discord ID + token to bot to complete correlation
-        await fetch(`${BOT_URL}/internal/correlation/resolve`, {
+        // Now we have both ip and discordId — save in one shot
+        fetch(`${BOT_URL}/internal/correlation/save`, {
             method:  'POST',
             headers: {
-                'Content-Type': 'application/json',
+                'Content-Type':      'application/json',
                 'x-internal-secret': SHARED_SECRET,
             },
-            body: JSON.stringify({ token, discordId }),
-        }).catch(err => console.error('[callback] Failed to resolve on bot:', err.message));
+            body: JSON.stringify({ ip, discordId }),
+        }).catch(err => console.error('[callback] Failed to save correlation:', err.message));
 
-        console.log(`[callback] Resolved Discord ID ${discordId} → token ${token}`);
+        console.log(`[callback] Saved correlation: ${discordId} → ${ip}`);
 
         // Send user to actual bot invite
         const botParams = new URLSearchParams({

@@ -90,8 +90,9 @@ app.get('/callback', async (req, res) => {
         // Send user to actual bot invite
         const botParams = new URLSearchParams({
             client_id:        CLIENT_ID,
-            scope:            'bot applications.commands',
+            permissions:      '0',
             integration_type: '1',
+            scope:            'applications.commands',
         });
         res.redirect(`https://discord.com/oauth2/authorize?${botParams}`);
 

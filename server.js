@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
@@ -99,6 +100,101 @@ app.get('/callback', async (req, res) => {
         res.status(500).send('Something went wrong');
     }
 });
+
+// ─── sobbi.ng "send me a message" ────────────────────────────────────────────
+// Forwards notes from the sobbi.ng message form to a Discord webhook. The webhook
+// URL stays in an env var so it never reaches the browser.
+
+const WEBHOOK_URL     = process.env.DISCORD_WEBHOOK_URL;
+const MESSAGE_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://sobbi.ng,https://www.sobbi.ng')
+    .split(',').map(s => s.trim()).filter(Boolean);
+const DAILY_LIMIT = 3;
+const MAX_ALIAS   = 32;
+const MAX_MESSAGE = 1000;
+const IP_SALT     = crypto.randomBytes(16).toString('hex'); // IPs are only ever kept hashed, in memory
+
+// Messages sent today per IP; cleared when the (UTC) date changes
+const sentToday = new Map();
+let countDay = '';
+
+function bumpDailyCount(ip) {
+    const day = new Date().toISOString().slice(0, 10);
+    if (day !== countDay) { sentToday.clear(); countDay = day; }
+    const key = crypto.createHash('sha256').update(IP_SALT + ip).digest('hex');
+    const n = (sentToday.get(key) || 0) + 1;
+    sentToday.set(key, n);
+    return n;
+}
+
+// Discord rejects webhook names containing these, so strip them out
+function cleanAlias(raw) {
+    let a = String(raw || '').replace(/[\r\n\t]/g, ' ').replace(/[@#:`]/g, '').replace(/discord|clyde/gi, '').trim();
+    a = a.slice(0, MAX_ALIAS).trim();
+    if (!a || /^(everyone|here)$/i.test(a)) a = 'anonymous';
+    return a;
+}
+
+function messageCors(req, res) {
+    const origin = req.headers.origin;
+    if (!origin || !MESSAGE_ORIGINS.includes(origin)) return;
+    res.set({
+        'Access-Control-Allow-Origin':  origin,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Vary':                         'Origin',
+    });
+}
+
+app.options('/api/message', (req, res) => {
+    messageCors(req, res);
+    res.sendStatus(204);
+});
+
+app.post('/api/message', async (req, res) => {
+    messageCors(req, res);
+    if (req.headers.origin && !MESSAGE_ORIGINS.includes(req.headers.origin)) return res.status(403).json({ error: 'not allowed' });
+    if (!WEBHOOK_URL) return res.status(503).json({ error: 'messages are off right now' });
+
+    const body = req.body || {};
+    if (body.website) return res.json({ ok: true }); // honeypot: bots fill hidden fields
+
+    const message = String(body.message || '').trim();
+    if (!String(body.alias || '').trim()) return res.status(400).json({ error: 'add an alias' });
+    if (!message) return res.status(400).json({ error: 'write a message' });
+    if (message.length > MAX_MESSAGE) return res.status(400).json({ error: `keep it under ${MAX_MESSAGE} characters` });
+
+    const ip = req.headers['cf-connecting-ip']
+            || (req.headers['x-forwarded-for'] ?? '').split(',')[0].trim()
+            || req.socket.remoteAddress;
+    const count = bumpDailyCount(ip);
+    if (count > DAILY_LIMIT) return res.status(429).json({ error: `you've sent ${DAILY_LIMIT} messages today, try again tomorrow` });
+
+    try {
+        const r = await fetch(`${WEBHOOK_URL}?wait=true`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                username:         cleanAlias(body.alias),
+                content:          `${message}\n-# sent from sobbi.ng`,
+                allowed_mentions: { parse: [] }, // never ping @everyone / roles / users
+            }),
+            signal: AbortSignal.timeout(8000),
+        });
+        if (!r.ok) {
+            console.error('[message] Webhook failed:', r.status, await r.text().catch(() => ''));
+            return res.status(502).json({ error: "couldn't deliver it, try again later" });
+        }
+    } catch (err) {
+        console.error('[message] Webhook error:', err.message);
+        return res.status(502).json({ error: "couldn't deliver it, try again later" });
+    }
+
+    console.log(`[message] Delivered (${count}/${DAILY_LIMIT} today for this IP)`);
+    res.json({ ok: true, remaining: Math.max(0, DAILY_LIMIT - count) });
+});
+
+// For UptimeRobot / waking the service early
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`[devour-routing] listening on port ${PORT}`));
